@@ -285,3 +285,37 @@ def debug_attempts(request: Request, email: str = "student@cybersabi.app"):
         "email_locked": email_locked,
         "email_seconds_remaining": email_remaining,
     }
+
+import sqlite3 as sqlite
+
+# ─── VULNERABLE endpoint — AppSec learning only ───────────────────────────────
+# ─── FIXED endpoint — parameterized query ─────────────────────────────────────
+# APPSEC: The fix is to NEVER concatenate user input into SQL.
+# Instead, pass input as a parameter using ? placeholders.
+# The database driver handles escaping — you never touch the raw SQL string.
+@app.get("/users/search")
+def search_users_safe(email: str):
+    conn = sqlite.connect("cybersabi.db")
+    cursor = conn.cursor()
+
+    # SAFE: The ? is a placeholder — the database driver substitutes the value
+    # AFTER parsing the SQL structure. The input can never change the query shape.
+    # Even if the attacker sends ' OR '1'='1, it's treated as a literal string,
+    # not as SQL syntax.
+    query = "SELECT id, email, name FROM users WHERE email = ?"
+
+    print(f"\n[SAFE QUERY]: {query} | params: ({email},)\n")
+
+    try:
+        # APPSEC: The second argument is a tuple of parameters.
+        # The driver escapes everything — single quotes, semicolons, UNION, DROP — all harmless.
+        cursor.execute(query, (email,))
+        result = cursor.fetchall()
+        conn.close()
+        return {"results": result}
+        # APPSEC: Notice we no longer return query_executed in the response.
+        # Never expose your SQL structure to the client — that's information disclosure.
+    except Exception as e:
+        conn.close()
+        # APPSEC: Return a generic error — never the raw exception message.
+        return {"error": "Search failed"}
