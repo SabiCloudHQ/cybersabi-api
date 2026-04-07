@@ -9,6 +9,7 @@ import datetime
 import time
 import os
 import sqlite3 as sqlite
+import secrets
 
 # ─── Environment ──────────────────────────────────────────────────────────────
 load_dotenv()
@@ -186,6 +187,31 @@ def create_token(email: str) -> str:
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+# ─── CSRF Protection ──────────────────────────────────────────────────────────
+# APPSEC: Double-submit cookie pattern.
+# Server sets a CSRF token in a readable cookie (not httpOnly).
+# Client reads it and sends it back in a request header.
+# Server verifies header value matches cookie value.
+# An attacker on evil.com cannot read your cookies — so they can't forge the header.
+
+def generate_csrf_token() -> str:
+    # APPSEC: secrets.token_hex generates a cryptographically secure random token.
+    # Never use random.random() for security tokens — it's predictable.
+    return secrets.token_hex(32)
+
+def verify_csrf_token(request: Request) -> bool:
+    # APPSEC: We check two things:
+    # 1. The X-CSRF-Token header exists and matches the csrf_token cookie
+    # 2. Both must be present — missing either means the request is suspicious
+    cookie_token = request.cookies.get("csrf_token")
+    header_token = request.headers.get("X-CSRF-Token")
+
+    if not cookie_token or not header_token:
+        return False
+
+    # APPSEC: secrets.compare_digest is a constant-time comparison.
+    # Regular == can leak timing information about how many characters matched.
+    return secrets.compare_digest(cookie_token, header_token)
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -195,6 +221,12 @@ def health():
 
 @app.post("/login")
 def login(body: LoginRequest, response: Response, request: Request):
+    # APPSEC: Verify CSRF token on all state-changing POST requests.
+    # Login is included — CSRF on login enables "login CSRF" attacks where
+    # an attacker logs you into THEIR account to harvest your activity.
+    if not verify_csrf_token(request):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
+
     ip = get_client_ip(request)
 
     locked, seconds_remaining = is_locked_out(ip)
@@ -230,8 +262,15 @@ def login(body: LoginRequest, response: Response, request: Request):
 
 
 @app.post("/logout")
-def logout(response: Response):
+def logout(response: Response, request: Request):
+    # APPSEC: Logout needs CSRF protection too.
+    # Without it, an attacker can force-logout any user by tricking them
+    # into visiting a page that sends POST /logout.
+    if not verify_csrf_token(request):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
+
     response.delete_cookie("token")
+    response.delete_cookie("csrf_token")
     return {"message": "Logged out"}
 
 
@@ -271,6 +310,26 @@ def debug_attempts(request: Request, email: str = "student@cybersabi.app"):
         "email_locked": email_locked,
         "email_seconds_remaining": email_remaining,
     }
+
+# APPSEC: GET /csrf-token — called by the frontend on app load.
+# Returns a CSRF token in a readable cookie (NOT httpOnly — JS needs to read it).
+# The token is random per session and expires with the session.
+@app.get("/csrf-token")
+def get_csrf_token(response: Response):
+    token = generate_csrf_token()
+
+    # APPSEC: This cookie is intentionally readable by JavaScript (no httponly).
+    # That's the point — the frontend reads it and sends it as a header.
+    # The auth token stays httpOnly — only the CSRF token is readable.
+    response.set_cookie(
+        key="csrf_token",
+        value=token,
+        httponly=False,    # MUST be readable by JS
+        samesite="strict", # Strictest setting — never sent cross-site
+        secure=False,      # Change to True in production
+        max_age=60 * 60,   # 1 hour
+    )
+    return {"csrf_token": token}
 
 
 # ─── SQL injection demo + fix ─────────────────────────────────────────────────
