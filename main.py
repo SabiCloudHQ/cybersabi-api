@@ -8,6 +8,7 @@ import bcrypt
 import datetime
 import time
 import os
+import sqlite3 as sqlite
 
 # ─── Environment ──────────────────────────────────────────────────────────────
 load_dotenv()
@@ -27,8 +28,6 @@ app = FastAPI()
 # APPSEC: CORS controls which domains can call this API from a browser.
 # Only allow localhost:5173 (your React dev server).
 # In production, change this to "https://cybersabi.app" only.
-# Allowing "*" lets any website call your API on behalf of a logged-in user —
-# that's a CORS misconfiguration vulnerability.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -37,8 +36,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Security Headers ─────────────────────────────────────────────────────────
+# APPSEC: Using @app.middleware instead of BaseHTTPMiddleware avoids a known
+# compatibility issue with newer Starlette versions and streaming responses.
+# Both approaches add headers to every response — this one is more reliable.
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+
+    # APPSEC: Content-Security-Policy — primary XSS defense.
+    # Tells the browser which sources of scripts/styles/images are trusted.
+    # Even if an attacker injects a <script> tag, the browser won't run it
+    # unless the source is in this whitelist.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'"
+    )
+
+    # APPSEC: X-Frame-Options — prevents clickjacking.
+    # Stops your app from being embedded in an <iframe> on an attacker's page.
+    # An attacker could overlay an invisible iframe over a fake button and trick
+    # users into clicking your real buttons without knowing it.
+    response.headers["X-Frame-Options"] = "DENY"
+
+    # APPSEC: X-Content-Type-Options — prevents MIME sniffing.
+    # Without this, browsers might execute a response as JavaScript even if
+    # the server says it's an image — called a MIME confusion attack.
+    response.headers["X-Content-Type-Options"] = "nosniff"
+
+    # APPSEC: Referrer-Policy — controls URL leakage.
+    # Prevents internal URLs like /admin/users/123 from being sent to
+    # third-party analytics or CDNs when a user clicks an external link.
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+    # APPSEC: Permissions-Policy — disables browser features you don't need.
+    # If an attacker gets XSS, they still can't access camera/mic/location
+    # because the browser policy blocks it at the platform level.
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=(), "
+        "payment=(), usb=(), magnetometer=()"
+    )
+
+    # APPSEC: Remove the Server header — don't fingerprint your stack.
+    # "Server: uvicorn" tells attackers exactly which CVEs to search for.
+    if "server" in response.headers:
+        del response.headers["server"]
+
+    # APPSEC: HSTS — forces HTTPS only. Commented out for local dev.
+    # Uncomment in production after confirming HTTPS works end to end.
+    # response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+
+    return response
+
 # ─── Password hashing ─────────────────────────────────────────────────────────
-# APPSEC: bcrypt is slow by design — makes brute-force attacks expensive.
+# APPSEC: bcrypt is slow by design — makes brute-force expensive.
 # Random salt per password means identical passwords produce different hashes
 # (prevents rainbow table attacks).
 
@@ -60,25 +115,16 @@ fake_users = {
 }
 
 # ─── Brute-force protection ───────────────────────────────────────────────────
-# APPSEC: Track failed attempts in memory — simple for learning.
-# In production use Redis so counts persist across restarts and multiple servers.
+LOCKOUT_THRESHOLD = 5
+EMAIL_LOCKOUT_THRESHOLD = 10
+LOCKOUT_WINDOW = 15 * 60
 
-LOCKOUT_THRESHOLD = 5        # IP lockout after this many failures
-EMAIL_LOCKOUT_THRESHOLD = 10 # Email lockout — higher to reduce DoS risk
-LOCKOUT_WINDOW = 15 * 60     # 15 minutes in seconds
-
-# Track by IP — stops single-source attacks
 failed_attempts = defaultdict(lambda: {"count": 0, "first_attempt": None})
-
-# Track by email — catches distributed attacks where attacker rotates IPs
-# FIX: declared once here only (duplicate declarations removed)
 failed_by_email = defaultdict(lambda: {"count": 0, "first_attempt": None})
 
 
 def get_client_ip(request: Request) -> str:
-    # APPSEC: X-Forwarded-For is set by load balancers/proxies.
-    # Only trust this header from your own infrastructure in production —
-    # attackers can spoof it if you accept it blindly from anywhere.
+    # APPSEC: Only trust X-Forwarded-For from your own infrastructure in production.
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -91,8 +137,7 @@ def is_locked_out(ip: str) -> tuple[bool, int]:
         elapsed = time.time() - record["first_attempt"]
         if elapsed < LOCKOUT_WINDOW:
             return True, int(LOCKOUT_WINDOW - elapsed)
-        else:
-            failed_attempts[ip] = {"count": 0, "first_attempt": None}
+        failed_attempts[ip] = {"count": 0, "first_attempt": None}
     return False, 0
 
 
@@ -104,7 +149,6 @@ def record_failure(ip: str):
 
 
 def reset_attempts(ip: str):
-    # APPSEC: Reset on success so legitimate users aren't permanently locked.
     failed_attempts[ip] = {"count": 0, "first_attempt": None}
 
 
@@ -114,8 +158,7 @@ def is_email_locked(email: str) -> tuple[bool, int]:
         elapsed = time.time() - record["first_attempt"]
         if elapsed < LOCKOUT_WINDOW:
             return True, int(LOCKOUT_WINDOW - elapsed)
-        else:
-            failed_by_email[email] = {"count": 0, "first_attempt": None}
+        failed_by_email[email] = {"count": 0, "first_attempt": None}
     return False, 0
 
 
@@ -131,8 +174,6 @@ def reset_email_attempts(email: str):
 
 
 # ─── Request models ───────────────────────────────────────────────────────────
-# APPSEC: Pydantic models enforce input shape — FastAPI rejects anything
-# that doesn't match. This is input validation against injection attacks.
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -140,19 +181,13 @@ class LoginRequest(BaseModel):
 
 # ─── JWT helper ───────────────────────────────────────────────────────────────
 def create_token(email: str) -> str:
-    # APPSEC: Always include exp — tokens without expiry are valid forever if stolen.
     expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=TOKEN_EXPIRE_MINUTES)
-    payload = {
-        "sub": email,   # who this token belongs to
-        "exp": expire,  # when it stops working
-    }
+    payload = {"sub": email, "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
-# APPSEC: Never expose version numbers or stack info in health endpoints —
-# helps attackers fingerprint your system.
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -162,71 +197,38 @@ def health():
 def login(body: LoginRequest, response: Response, request: Request):
     ip = get_client_ip(request)
 
-    # APPSEC: Check IP lockout first — single-source brute-force
     locked, seconds_remaining = is_locked_out(ip)
     if locked:
-        minutes = seconds_remaining // 60
-        seconds = seconds_remaining % 60
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many failed attempts. Try again in {minutes}m {seconds}s."
-        )
+        minutes, seconds = seconds_remaining // 60, seconds_remaining % 60
+        raise HTTPException(status_code=429, detail=f"Too many failed attempts. Try again in {minutes}m {seconds}s.")
 
-    # APPSEC: Check email lockout — distributed brute-force across many IPs
     email_locked, email_seconds = is_email_locked(body.email)
     if email_locked:
-        minutes = email_seconds // 60
-        seconds = email_seconds % 60
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many failed attempts. Try again in {minutes}m {seconds}s."
-        )
+        minutes, seconds = email_seconds // 60, email_seconds % 60
+        raise HTTPException(status_code=429, detail=f"Too many failed attempts. Try again in {minutes}m {seconds}s.")
 
     user = fake_users.get(body.email)
 
     if not user or not verify_password(body.password, user["hashed_password"]):
-        # APPSEC: Record failure against BOTH IP and email
         record_failure(ip)
         record_email_failure(body.email)
-
         current_count = failed_attempts[ip]["count"]
-        remaining_attempts = LOCKOUT_THRESHOLD - current_count
+        remaining = LOCKOUT_THRESHOLD - current_count
+        if remaining <= 0:
+            raise HTTPException(status_code=429, detail="Too many failed attempts. Try again in 15 minutes.")
+        # APPSEC: Same message for wrong email OR password — prevents username enumeration.
+        raise HTTPException(status_code=401, detail=f"Invalid email or password. {remaining} attempt(s) remaining.")
 
-        if remaining_attempts <= 0:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many failed attempts. Try again in 15 minutes."
-            )
-
-        # APPSEC: Same message for wrong email OR wrong password — prevents
-        # username enumeration (attacker can't tell which field was wrong).
-        raise HTTPException(
-            status_code=401,
-            detail=f"Invalid email or password. {remaining_attempts} attempt(s) remaining."
-        )
-
-    # APPSEC: Reset BOTH counters on success
     reset_attempts(ip)
     reset_email_attempts(body.email)
 
     token = create_token(body.email)
-
-    # APPSEC: httpOnly=True — JavaScript cannot read this cookie (XSS protection)
-    # samesite="lax" — CSRF protection
-    # secure=False — HTTP allowed locally; set True in production (HTTPS only)
-    response.set_cookie(
-        key="token",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=60 * TOKEN_EXPIRE_MINUTES,
-    )
+    # APPSEC: httpOnly cookie — JS cannot read it (XSS protection).
+    # samesite=lax — CSRF protection. secure=False for local dev only.
+    response.set_cookie(key="token", value=token, httponly=True, samesite="lax", secure=False, max_age=60 * TOKEN_EXPIRE_MINUTES)
     return {"message": "Login successful"}
 
 
-# APPSEC: Logout clears the cookie server-side — more secure than
-# localStorage where the client controls deletion.
 @app.post("/logout")
 def logout(response: Response):
     response.delete_cookie("token")
@@ -235,41 +237,25 @@ def logout(response: Response):
 
 @app.get("/me")
 def get_me(request: Request):
-    # APPSEC: Read token from cookie — never from query params (they appear in logs).
     token = request.cookies.get("token")
-
-    # APPSEC: 401 = not authenticated | 403 = authenticated but not authorized
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-
     try:
-        # APPSEC: jwt.decode verifies signature AND expiry automatically.
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
-
         if not email:
             raise HTTPException(status_code=401, detail="Invalid token")
-
-        # APPSEC: Always re-fetch the user — they may have been deleted/suspended
-        # after the token was issued.
         user = fake_users.get(email)
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-
-        # APPSEC: Return only what the frontend needs — never hashed password
-        # or internal fields.
         return {"email": user["email"], "name": user["name"]}
-
     except HTTPException:
         raise
-
     except Exception:
-        # APPSEC: Same vague error for all token failures — never reveal why.
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
-# APPSEC: REMOVE THIS IN PRODUCTION.
-# Exposes internal rate-limit state — useful for learning, dangerous in prod.
+# APPSEC: REMOVE IN PRODUCTION — exposes internal rate-limit state.
 @app.get("/debug/attempts")
 def debug_attempts(request: Request, email: str = "student@cybersabi.app"):
     ip = get_client_ip(request)
@@ -286,36 +272,24 @@ def debug_attempts(request: Request, email: str = "student@cybersabi.app"):
         "email_seconds_remaining": email_remaining,
     }
 
-import sqlite3 as sqlite
 
-# ─── VULNERABLE endpoint — AppSec learning only ───────────────────────────────
-# ─── FIXED endpoint — parameterized query ─────────────────────────────────────
-# APPSEC: The fix is to NEVER concatenate user input into SQL.
-# Instead, pass input as a parameter using ? placeholders.
-# The database driver handles escaping — you never touch the raw SQL string.
+# ─── SQL injection demo + fix ─────────────────────────────────────────────────
+# APPSEC: Fixed endpoint using parameterized queries.
+# The vulnerable version concatenated user input into SQL directly — allowing
+# OR bypass, UNION password dumps, and error-based fingerprinting.
+# The fix: pass input as a ? parameter — it's always treated as a literal string.
 @app.get("/users/search")
 def search_users_safe(email: str):
     conn = sqlite.connect("cybersabi.db")
     cursor = conn.cursor()
-
-    # SAFE: The ? is a placeholder — the database driver substitutes the value
-    # AFTER parsing the SQL structure. The input can never change the query shape.
-    # Even if the attacker sends ' OR '1'='1, it's treated as a literal string,
-    # not as SQL syntax.
-    query = "SELECT id, email, name FROM users WHERE email = ?"
-
-    print(f"\n[SAFE QUERY]: {query} | params: ({email},)\n")
-
     try:
-        # APPSEC: The second argument is a tuple of parameters.
-        # The driver escapes everything — single quotes, semicolons, UNION, DROP — all harmless.
-        cursor.execute(query, (email,))
+        # SAFE: ? placeholder — input can never change the query structure
+        cursor.execute("SELECT id, email, name FROM users WHERE email = ?", (email,))
         result = cursor.fetchall()
         conn.close()
+        # APPSEC: Don't return the raw query — that's information disclosure
         return {"results": result}
-        # APPSEC: Notice we no longer return query_executed in the response.
-        # Never expose your SQL structure to the client — that's information disclosure.
-    except Exception as e:
+    except Exception:
         conn.close()
-        # APPSEC: Return a generic error — never the raw exception message.
+        # APPSEC: Generic error — never expose the raw exception message
         return {"error": "Search failed"}
