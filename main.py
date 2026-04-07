@@ -1,14 +1,16 @@
 from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict
 from pydantic import BaseModel
 from jose import jwt
 from dotenv import load_dotenv
 import bcrypt
 import datetime
+import time
 import os
 
 # ─── Environment ──────────────────────────────────────────────────────────────
-load_dotenv()  # reads .env file into environment
+load_dotenv()
 
 # APPSEC: Load secret from environment, never hardcode it.
 # If SECRET_KEY is missing, we crash immediately rather than run insecurely.
@@ -30,29 +32,25 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
-    allow_credentials=True,   # Required for cookies to work cross-origin
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── Password hashing helpers ─────────────────────────────────────────────────
-# APPSEC: bcrypt is slow by design — it makes brute-force attacks expensive.
-# It auto-generates a random salt per password so identical passwords produce
-# different hashes (prevents rainbow table attacks).
+# ─── Password hashing ─────────────────────────────────────────────────────────
+# APPSEC: bcrypt is slow by design — makes brute-force attacks expensive.
+# Random salt per password means identical passwords produce different hashes
+# (prevents rainbow table attacks).
 
 def hash_password(plain: str) -> str:
-    # APPSEC: bcrypt.hashpw needs bytes — encode first.
-    # gensalt() generates a unique random salt for each hash.
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 def verify_password(plain: str, hashed: str) -> bool:
-    # APPSEC: checkpw uses constant-time comparison.
-    # Using == to compare strings leaks timing info attackers can exploit.
+    # APPSEC: checkpw uses constant-time comparison — prevents timing attacks.
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 # ─── Fake user database ───────────────────────────────────────────────────────
 # APPSEC: Passwords stored as bcrypt hashes — never plain text.
-# Even a full database dump can't be reversed without brute-forcing each hash.
 fake_users = {
     "student@cybersabi.app": {
         "email": "student@cybersabi.app",
@@ -61,18 +59,88 @@ fake_users = {
     }
 }
 
+# ─── Brute-force protection ───────────────────────────────────────────────────
+# APPSEC: Track failed attempts in memory — simple for learning.
+# In production use Redis so counts persist across restarts and multiple servers.
+
+LOCKOUT_THRESHOLD = 5        # IP lockout after this many failures
+EMAIL_LOCKOUT_THRESHOLD = 10 # Email lockout — higher to reduce DoS risk
+LOCKOUT_WINDOW = 15 * 60     # 15 minutes in seconds
+
+# Track by IP — stops single-source attacks
+failed_attempts = defaultdict(lambda: {"count": 0, "first_attempt": None})
+
+# Track by email — catches distributed attacks where attacker rotates IPs
+# FIX: declared once here only (duplicate declarations removed)
+failed_by_email = defaultdict(lambda: {"count": 0, "first_attempt": None})
+
+
+def get_client_ip(request: Request) -> str:
+    # APPSEC: X-Forwarded-For is set by load balancers/proxies.
+    # Only trust this header from your own infrastructure in production —
+    # attackers can spoof it if you accept it blindly from anywhere.
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host
+
+
+def is_locked_out(ip: str) -> tuple[bool, int]:
+    record = failed_attempts[ip]
+    if record["count"] >= LOCKOUT_THRESHOLD:
+        elapsed = time.time() - record["first_attempt"]
+        if elapsed < LOCKOUT_WINDOW:
+            return True, int(LOCKOUT_WINDOW - elapsed)
+        else:
+            failed_attempts[ip] = {"count": 0, "first_attempt": None}
+    return False, 0
+
+
+def record_failure(ip: str):
+    record = failed_attempts[ip]
+    if record["count"] == 0:
+        record["first_attempt"] = time.time()
+    record["count"] += 1
+
+
+def reset_attempts(ip: str):
+    # APPSEC: Reset on success so legitimate users aren't permanently locked.
+    failed_attempts[ip] = {"count": 0, "first_attempt": None}
+
+
+def is_email_locked(email: str) -> tuple[bool, int]:
+    record = failed_by_email[email]
+    if record["count"] >= EMAIL_LOCKOUT_THRESHOLD:
+        elapsed = time.time() - record["first_attempt"]
+        if elapsed < LOCKOUT_WINDOW:
+            return True, int(LOCKOUT_WINDOW - elapsed)
+        else:
+            failed_by_email[email] = {"count": 0, "first_attempt": None}
+    return False, 0
+
+
+def record_email_failure(email: str):
+    record = failed_by_email[email]
+    if record["count"] == 0:
+        record["first_attempt"] = time.time()
+    record["count"] += 1
+
+
+def reset_email_attempts(email: str):
+    failed_by_email[email] = {"count": 0, "first_attempt": None}
+
+
 # ─── Request models ───────────────────────────────────────────────────────────
-# APPSEC: Pydantic models define exactly what shape this endpoint accepts.
-# FastAPI automatically rejects anything that doesn't match — this is input
-# validation, one of the most important AppSec defenses against injection attacks.
+# APPSEC: Pydantic models enforce input shape — FastAPI rejects anything
+# that doesn't match. This is input validation against injection attacks.
 class LoginRequest(BaseModel):
     email: str
     password: str
 
-# ─── Helper: create JWT ───────────────────────────────────────────────────────
+
+# ─── JWT helper ───────────────────────────────────────────────────────────────
 def create_token(email: str) -> str:
-    # APPSEC: Always include exp (expiry) — tokens without it are valid forever
-    # if stolen. sub (subject) identifies who the token belongs to.
+    # APPSEC: Always include exp — tokens without expiry are valid forever if stolen.
     expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": email,   # who this token belongs to
@@ -80,93 +148,140 @@ def create_token(email: str) -> str:
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
-# APPSEC: Health endpoint — never expose version numbers or stack details here.
-# That information helps attackers fingerprint your system.
+# APPSEC: Never expose version numbers or stack info in health endpoints —
+# helps attackers fingerprint your system.
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# APPSEC: POST /login — three rules for a secure login:
-# 1. Same error for wrong email OR wrong password (prevents username enumeration)
-# 2. Verify against bcrypt hash, never compare plain text
-# 3. Set token as httpOnly cookie — never return it in the response body
+
 @app.post("/login")
-def login(body: LoginRequest, response: Response):
+def login(body: LoginRequest, response: Response, request: Request):
+    ip = get_client_ip(request)
+
+    # APPSEC: Check IP lockout first — single-source brute-force
+    locked, seconds_remaining = is_locked_out(ip)
+    if locked:
+        minutes = seconds_remaining // 60
+        seconds = seconds_remaining % 60
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {minutes}m {seconds}s."
+        )
+
+    # APPSEC: Check email lockout — distributed brute-force across many IPs
+    email_locked, email_seconds = is_email_locked(body.email)
+    if email_locked:
+        minutes = email_seconds // 60
+        seconds = email_seconds % 60
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {minutes}m {seconds}s."
+        )
+
     user = fake_users.get(body.email)
 
-    # APPSEC: "Invalid email or password" — intentionally vague.
-    # Separate messages ("email not found" vs "wrong password") let attackers
-    # enumerate valid accounts by trying different inputs.
     if not user or not verify_password(body.password, user["hashed_password"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        # APPSEC: Record failure against BOTH IP and email
+        record_failure(ip)
+        record_email_failure(body.email)
+
+        current_count = failed_attempts[ip]["count"]
+        remaining_attempts = LOCKOUT_THRESHOLD - current_count
+
+        if remaining_attempts <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed attempts. Try again in 15 minutes."
+            )
+
+        # APPSEC: Same message for wrong email OR wrong password — prevents
+        # username enumeration (attacker can't tell which field was wrong).
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid email or password. {remaining_attempts} attempt(s) remaining."
+        )
+
+    # APPSEC: Reset BOTH counters on success
+    reset_attempts(ip)
+    reset_email_attempts(body.email)
 
     token = create_token(body.email)
 
-    # APPSEC: httpOnly cookie — JavaScript cannot read this at all.
-    # Even a successful XSS attack cannot steal this token.
-    # samesite="lax" adds CSRF protection — cookie only sent on same-site requests.
-    # secure=False for local dev only — set True in production (HTTPS required).
+    # APPSEC: httpOnly=True — JavaScript cannot read this cookie (XSS protection)
+    # samesite="lax" — CSRF protection
+    # secure=False — HTTP allowed locally; set True in production (HTTPS only)
     response.set_cookie(
         key="token",
         value=token,
         httponly=True,
         samesite="lax",
-        secure=False,               # Change to True in production
+        secure=False,
         max_age=60 * TOKEN_EXPIRE_MINUTES,
     )
-
-    # APPSEC: Return only a success message — never the token in the body.
-    # The token travels in the cookie only, invisible to JavaScript.
     return {"message": "Login successful"}
 
-# APPSEC: POST /logout — clears the cookie server-side.
-# More secure than localStorage where the client controls deletion.
+
+# APPSEC: Logout clears the cookie server-side — more secure than
+# localStorage where the client controls deletion.
 @app.post("/logout")
 def logout(response: Response):
     response.delete_cookie("token")
     return {"message": "Logged out"}
 
-# APPSEC: GET /me — protected route.
-# Reads the httpOnly cookie, verifies the JWT signature and expiry,
-# confirms the user still exists, then returns safe user data.
+
 @app.get("/me")
 def get_me(request: Request):
-    # APPSEC: Read token from cookie — browser sends it automatically.
-    # Never accept tokens from query params (?token=...) — they appear in logs.
+    # APPSEC: Read token from cookie — never from query params (they appear in logs).
     token = request.cookies.get("token")
 
-    # APPSEC: 401 = not authenticated (no valid identity)
-    # 403 = authenticated but not authorized (right identity, wrong permission)
+    # APPSEC: 401 = not authenticated | 403 = authenticated but not authorized
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     try:
-        # APPSEC: jwt.decode verifies two things:
-        # 1. Signature — was this signed with our SECRET_KEY?
-        # 2. Expiry — has it expired?
-        # Either failure raises an exception — caught below.
+        # APPSEC: jwt.decode verifies signature AND expiry automatically.
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
 
         if not email:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-        # APPSEC: Always look up the user in the database even with a valid token.
-        # The user may have been deleted or suspended after the token was issued.
+        # APPSEC: Always re-fetch the user — they may have been deleted/suspended
+        # after the token was issued.
         user = fake_users.get(email)
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
 
-        # APPSEC: Return only what the frontend needs — never the hashed password
-        # or any internal fields.
+        # APPSEC: Return only what the frontend needs — never hashed password
+        # or internal fields.
         return {"email": user["email"], "name": user["name"]}
 
     except HTTPException:
-        raise  # re-raise intentional 401s from above
+        raise
 
     except Exception:
-        # APPSEC: Any token error (expired, tampered, wrong signature) returns
-        # the same vague 401. Never reveal WHY the token was rejected.
+        # APPSEC: Same vague error for all token failures — never reveal why.
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+# APPSEC: REMOVE THIS IN PRODUCTION.
+# Exposes internal rate-limit state — useful for learning, dangerous in prod.
+@app.get("/debug/attempts")
+def debug_attempts(request: Request, email: str = "student@cybersabi.app"):
+    ip = get_client_ip(request)
+    ip_locked, ip_remaining = is_locked_out(ip)
+    email_locked, email_remaining = is_email_locked(email)
+    return {
+        "ip": ip,
+        "ip_failed_count": failed_attempts[ip]["count"],
+        "ip_locked": ip_locked,
+        "ip_seconds_remaining": ip_remaining,
+        "email": email,
+        "email_failed_count": failed_by_email[email]["count"],
+        "email_locked": email_locked,
+        "email_seconds_remaining": email_remaining,
+    }
